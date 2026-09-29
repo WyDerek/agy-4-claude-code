@@ -271,6 +271,7 @@ Delegation doesn't save money by itself — these do (also in the skill):
   was reported *not* to match. Either way: run write tasks on a branch and verify with
   `git status`; the wrapper maps both denial shapes — the soft one (agy 1.1.3+, and again
   from 1.1.20; re-measured on 1.1.25) and 1.1.13's hard error — to exit `15`.
+- **No capacity (503):** on the `flash` / `flash-lo` model the wrapper retries down a fallback chain — 3.8 Flash -> 3.7 Flash (same effort) -> 3.1 Pro (High), at most 3 attempts — configurable via the `fallback_flash` / `fallback_flash_lo` options (`off` disables). If every model in the chain answers 503 it exits `16` (`CAPACITY_EXHAUSTED`); `pro` has no chain and a 503 there is still exit `2`.
 - **Native Windows (no ConPTY):** headless `agy -p` / `agy models` can hard-hang with a 0-byte log when stdio is redirected ([issue #6](https://github.com/yuting0624/antigravity-for-claude-code/issues/6)). The wrapper wraps agy in a wall-clock `timeout`/`gtimeout` guard so it returns a structured TIMEOUT (exit 12) instead of hanging; `doctor` reports the likely hang instead of a misleading "not authenticated". Without `timeout` on PATH there's no safety net — use **WSL/macOS/Linux** for headless delegation.
 - **WSL:** running agy with `--add-dir` on a Windows mount (`/mnt/c/...`) is very slow — agy reads the workspace over a 9p bridge, so even trivial calls can take 20s+. Keep the repo on the WSL Linux filesystem (`~`). The wrapper and `doctor` warn about this.
 

@@ -1,6 +1,6 @@
 {
   "name": "antigravity",
-  "version": "0.28.0",
+  "version": "0.29.0",
   "description": "Run the Antigravity CLI (Gemini) as a collaborating AI inside Claude Code, with intelligent model routing across the SDLC. Claude conducts — requirements, architecture, the hard 20%, verification, review — and routes deterministic, high-volume work (scaffolding, tests, first-pass review, migrations, web/Vertex AI Search) to Antigravity. Hybrid agentic engineering; lower token cost as a financial lever.",
   "author": {
     "name": "linyuting"
@@ -53,6 +53,18 @@
       "type": "string",
       "title": "Model for the 'flash-lo' tier",
       "description": "Override the exact agy model the 'flash-lo' tier maps to (default: Gemini 3.8 Flash (Low)). Use a name from `agy models`.",
+      "default": ""
+    },
+    "fallback_flash": {
+      "type": "string",
+      "title": "Capacity fallback chain for the 'flash' tier",
+      "description": "Pipe-separated exact model names agy-delegate tries, in order, when the flash model answers 503 / no capacity (max 3 attempts in all). Empty = 'Gemini 3.7 Flash (High)|Gemini 3.1 Pro (High)'. 'off' disables.",
+      "default": ""
+    },
+    "fallback_flash_lo": {
+      "type": "string",
+      "title": "Capacity fallback chain for the 'flash-lo' tier",
+      "description": "Pipe-separated exact model names agy-delegate tries, in order, when the flash-lo model answers 503 / no capacity (max 3 attempts in all). Empty = 'Gemini 3.7 Flash (Low)|Gemini 3.1 Pro (High)'. 'off' disables.",
       "default": ""
     },
     "tier_pro": {

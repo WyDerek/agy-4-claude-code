@@ -159,6 +159,28 @@ case "${STUB_MODE:-text}" in
   # at the first `"` loses it and the failure misclassifies. This is what shipped.
   json_err_quoted) printf '{"conversation_id":"","status":"ERROR","response":"","error":"invalid model selection (--model \\"X\\" --effort \\"\\"): model X is not recognized as a known model or custom model in settings","usage":{}}'; exit 1 ;;
   json_quota) printf '{"conversation_id":"","status":"ERROR","response":"","error":"quota exceeded for this model","usage":{}}'; exit 1 ;;
+  fallback_fb)
+    # find the model from the arguments
+    m=""
+    for ((i=1; i<=$#; i++)); do
+      if [ "${!i}" = "--model" ]; then
+        idx=$((i+1))
+        m="${!idx}"
+        break
+      fi
+    done
+    if [ "$m" = "Gemini 3.8 Flash (High)" ] || [ "$m" = "Gemini 3.8 Flash (Low)" ]; then
+       printf '{"conversation_id":"","status":"ERROR","response":"","error":"503 The model is overloaded","usage":{}}'; exit 1
+    elif [ "$m" = "Gemini 3.7 Flash (High)" ] || [ "$m" = "Gemini 3.7 Flash (Low)" ] || [ "$m" = "X Model" ]; then
+       printf '{"conversation_id":"c1","status":"SUCCESS","response":"JSONBODY_SECOND\n","usage":{"input_tokens":10,"output_tokens":2,"thinking_tokens":1,"cache_read_tokens":3,"total_tokens":16}}'; exit 0
+    else
+       echo "fallback_fb unexpected model $m" >&2; exit 1
+    fi
+    ;;
+  fallback_all_503)
+    echo "503 no capacity" >&2; exit 1 ;;
+  fallback_pro)
+    echo "503 no capacity on pro" >&2; exit 1 ;;
   *)       echo "STUB_OK" ;;
 esac
 STUB
@@ -623,6 +645,43 @@ out=$(WSL_DISTRO_NAME=Ubuntu "$DELEGATE" --dir /home/u/proj --print-command "hi"
 if grep -q "9p bridge" <<<"$out"; then echo "FAIL: slow-mount note fired for a Linux-FS --dir"; FAIL=$((FAIL+1));
 else echo "ok: no slow-mount note for a Linux-FS --dir"; PASS=$((PASS+1)); fi
 
+
+# --- capacity fallback tests ---
+# flash tier: first model returns 503 no capacity, second succeeds -> exit 0
+err=$(STUB_JSON_CAPABLE=1 STUB_MODE=fallback_fb "$DELEGATE" --tier flash "hi" 2>&1 >/dev/null); rc=$?
+check "fallback (flash): first fails 503, second succeeds -> exit 0" 0 "$rc" "retrying on" "$err"
+check "fallback (flash): stderr retry line mentions next model" 0 "$rc" "retrying on 'Gemini 3.7 Flash (High)'" "$err"
+check "fallback (flash): AGY_USAGE reports fallback_from" 0 "$rc" '"fallback_from": "Gemini 3.8 Flash (High)"' "$err"
+check "fallback (flash): AGY_USAGE reports final model" 0 "$rc" '"model": "Gemini 3.7 Flash (High)"' "$err"
+
+# all three 503 -> exit 16 + CAPACITY_EXHAUSTED
+out=$(STUB_JSON_CAPABLE=1 STUB_MODE=fallback_all_503 "$DELEGATE" --tier flash "hi" 2>&1); rc=$?
+check "fallback: all fail -> exit 16" 16 "$rc" "CAPACITY_EXHAUSTED" "$out"
+check "fallback: all fail signal mentions exhausted models" 16 "$rc" "no capacity on: Gemini 3.8 Flash (High), Gemini 3.7 Flash (High), Gemini 3.1 Pro (High)" "$out"
+
+# flash-lo chain uses 3.7 Flash (Low) first
+err=$(STUB_JSON_CAPABLE=1 STUB_MODE=fallback_fb "$DELEGATE" --tier flash-lo "hi" 2>&1 >/dev/null); rc=$?
+check "fallback (flash-lo): first fails 503, second succeeds -> exit 0" 0 "$rc" "retrying on 'Gemini 3.7 Flash (Low)'" "$err"
+
+# pro with 503 -> no retry, generic exit 2
+out=$(STUB_MODE=fallback_pro "$DELEGATE" --tier pro "hi" 2>&1); rc=$?
+check "fallback (pro): no retry on 503 -> exit 2" 2 "$rc" "agy exited 1" "$out"
+
+# quota error on flash -> exit 10, no retry
+out=$(STUB_JSON_CAPABLE=1 STUB_MODE=json_quota "$DELEGATE" --tier flash "hi" 2>&1); rc=$?
+check "fallback: quota error -> exit 10, no retry" 10 "$rc" "QUOTA_EXHAUSTED" "$out"
+
+# FALLBACK_FLASH=off -> no retry
+out=$(STUB_MODE=fallback_all_503 CLAUDE_PLUGIN_OPTION_FALLBACK_FLASH=off "$DELEGATE" --tier flash "hi" 2>&1); rc=$?
+check "fallback: off via config -> no retry, normal exit 2" 2 "$rc" "agy exited 1" "$out"
+
+# custom config
+err=$(STUB_JSON_CAPABLE=1 STUB_MODE=fallback_fb CLAUDE_PLUGIN_OPTION_FALLBACK_FLASH="X Model" "$DELEGATE" --tier flash "hi" 2>&1 >/dev/null); rc=$?
+check "fallback: custom config -> retries on X Model" 0 "$rc" "retrying on 'X Model'" "$err"
+
+# explicit --model falls back too
+err=$(STUB_JSON_CAPABLE=1 STUB_MODE=fallback_fb "$DELEGATE" --model "Gemini 3.8 Flash (High)" "hi" 2>&1 >/dev/null); rc=$?
+check "fallback: explicit --model matching tier model also falls back" 0 "$rc" "retrying on 'Gemini 3.7 Flash (High)'" "$err"
 echo "== cloud-debug.sh (Cloud Run log digest engine) =="
 CLOUD="$ROOT/scripts/cloud-debug.sh"
 

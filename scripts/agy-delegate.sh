@@ -50,6 +50,7 @@
 #             |    denied_actions, measured on 1.2.0) and 1.1.13's hard error (rc 1, "user
 #             |    denied permission", 1.1.13-1.1.19). Add a permissions.allow rule, or --yolo.
 #             |    URL reads need a grant too since 1.1.28 (read_url(<target>), or the flag).
+#             | 16 capacity exhausted — every model in the flash / flash-lo fallback chain answered 503
 #
 # On a classifiable failure, a machine-readable line is printed to stderr so
 # orchestrators (e.g. agy-job.sh) can react without scraping prose:
@@ -297,6 +298,42 @@ if on_wsl; then
   done
 fi
 
+
+# Determine capacity fallback chain based on the starting model
+DEF_FLASH="$(model_for_tier flash)"
+DEF_FLASH_LO="$(model_for_tier flash-lo)"
+
+if [ "$MODEL" = "$DEF_FLASH" ]; then
+  fb="${CLAUDE_PLUGIN_OPTION_FALLBACK_FLASH-}"
+  [ -z "$fb" ] && fb="Gemini 3.7 Flash (High)|Gemini 3.1 Pro (High)"
+elif [ "$MODEL" = "$DEF_FLASH_LO" ]; then
+  fb="${CLAUDE_PLUGIN_OPTION_FALLBACK_FLASH_LO-}"
+  [ -z "$fb" ] && fb="Gemini 3.7 Flash (Low)|Gemini 3.1 Pro (High)"
+else
+  fb="off"
+fi
+
+MODELS_TO_TRY=("$MODEL")
+if [ "$(printf '%s' "$fb" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" != "off" ]; then
+  IFS="|" read -ra fb_parts <<< "$fb"
+  for p in "${fb_parts[@]}"; do
+    p="$(printf '%s' "$p" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -n "$p" ]; then
+      already=0
+      for m in "${MODELS_TO_TRY[@]}"; do
+        if [ "$m" = "$p" ]; then already=1; break; fi
+      done
+      if [ "$already" -eq 0 ]; then
+        MODELS_TO_TRY+=("$p")
+      fi
+    fi
+  done
+fi
+
+if [ "${#MODELS_TO_TRY[@]}" -gt 3 ]; then
+  MODELS_TO_TRY=("${MODELS_TO_TRY[@]:0:3}")
+fi
+
 # Heads-up: a likely write task with no visible write grant. Headless agy's write
 # behavior has shifted across versions (describe-only pre-1.1.0; scratch-divert
 # 1.1.0-1.1.2; soft-deny on 1.1.3+; hard error by 1.1.13; soft again from 1.1.20, measured
@@ -338,13 +375,13 @@ fi
 # --- assemble agy args ---
 # NOTE: in agy, -p/--print/--prompt TAKES THE PROMPT AS ITS VALUE, so it must come
 # last with the prompt attached. Other flags go before it.
-ARGS=(--model "$MODEL" --print-timeout "$TIMEOUT")
-for d in "${ADD_DIRS[@]:-}"; do [ -n "$d" ] && ARGS+=(--add-dir "$d"); done
-[ "$YOLO" -eq 1 ]      && ARGS+=(--dangerously-skip-permissions)
-[ -n "$MODE" ]         && ARGS+=(--mode "$MODE")     # agy >= 1.1.0
-[ "$SANDBOX" -eq 1 ]   && ARGS+=(--sandbox)
-[ "$CONTINUE" -eq 1 ]  && ARGS+=(--continue)        # keep working context on the cheap (Gemini) side
-[ -n "$CONV_ID" ]      && ARGS+=(--conversation "$CONV_ID")
+ARGS_BASE=(--print-timeout "$TIMEOUT")
+for d in "${ADD_DIRS[@]:-}"; do [ -n "$d" ] && ARGS_BASE+=(--add-dir "$d"); done
+[ "$YOLO" -eq 1 ]      && ARGS_BASE+=(--dangerously-skip-permissions)
+[ -n "$MODE" ]         && ARGS_BASE+=(--mode "$MODE")     # agy >= 1.1.0
+[ "$SANDBOX" -eq 1 ]   && ARGS_BASE+=(--sandbox)
+[ "$CONTINUE" -eq 1 ]  && ARGS_BASE+=(--continue)        # keep working context on the cheap (Gemini) side
+[ -n "$CONV_ID" ]      && ARGS_BASE+=(--conversation "$CONV_ID")
 
 # --- structured output (agy >= 1.1.8) -----------------------------------------
 # agy gained `--output-format json`, which is strictly better for a wrapper than
@@ -399,14 +436,14 @@ case "$(printf '%s' "$raw_so" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
       # `|| true` so the assignment cannot fail under `set -e` and skip the rm.
       agy_help="$(cat "$HELPF" 2>/dev/null || true)"; rm -f "$HELPF"
       case "$agy_help" in
-        *--output-format*) JSON_MODE=1; ARGS+=(--output-format json) ;;
+        *--output-format*) JSON_MODE=1; ARGS_BASE+=(--output-format json) ;;
       esac
     fi ;;
 esac
 
 # --- dry run: print the resolved (shell-quoted) agy invocation and exit ---
 if [ "$PRINT_CMD" -eq 1 ]; then
-  { printf 'agy'; printf ' %q' "${ARGS[@]}" -p "$PROMPT"; printf '\n'; }
+  ARGS=(--model "${MODELS_TO_TRY[0]}" "${ARGS_BASE[@]}"); { printf 'agy'; printf ' %q' "${ARGS[@]}" -p "$PROMPT"; printf '\n'; }
   exit 0
 fi
 
@@ -435,17 +472,35 @@ if on_windows_native && [ -z "$TO_CMD" ]; then
   echo "agy-delegate:   call never returns, run from WSL/macOS/Linux, or install coreutils \`timeout\`." >&2
 fi
 
-set +e
-if [ -n "$TO_CMD" ]; then
-  # --kill-after sends SIGKILL if agy ignores the initial SIGTERM (defensive).
-  "$TO_CMD" --kill-after=10 "$TO_SECS" agy "${ARGS[@]}" -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
-  RC=$?
-else
-  agy "${ARGS[@]}" -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
-  RC=$?
-fi
-OUT="$(cat "$OUTF" 2>/dev/null)"
-set -e
+# One pass per model in MODELS_TO_TRY. Only a no-capacity failure moves on to the next
+# model; every other outcome (success or a classified failure) leaves the loop exactly as
+# the single-shot code did. MODEL tracks the attempt in flight so AGY_SIGNAL and the
+# messages name the model that actually ran; START_MODEL feeds AGY_USAGE's fallback_from.
+START_MODEL="$MODEL"
+ATTEMPT=0
+TOTAL_ATTEMPTS="${#MODELS_TO_TRY[@]}"
+
+for CURRENT_MODEL in "${MODELS_TO_TRY[@]}"; do
+  ATTEMPT=$((ATTEMPT + 1))
+  MODEL="$CURRENT_MODEL"
+  if [ "$ATTEMPT" -gt 1 ]; then
+    echo "agy-delegate: '${MODELS_TO_TRY[$((ATTEMPT-2))]}' had no capacity (503); retrying on '$CURRENT_MODEL' (attempt $ATTEMPT/$TOTAL_ATTEMPTS)" >&2
+  fi
+
+  ARGS=(--model "$CURRENT_MODEL" "${ARGS_BASE[@]}")
+  > "$ERR"; > "$OUTF"
+
+  set +e
+  if [ -n "$TO_CMD" ]; then
+    # --kill-after sends SIGKILL if agy ignores the initial SIGTERM (defensive).
+    "$TO_CMD" --kill-after=10 "$TO_SECS" agy "${ARGS[@]}" -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
+    RC=$?
+  else
+    agy "${ARGS[@]}" -p "$PROMPT" < /dev/null >"$OUTF" 2>"$ERR"
+    RC=$?
+  fi
+  OUT="$(cat "$OUTF" 2>/dev/null)"
+  set -e
 
 # --- unwrap the structured envelope (JSON mode) --------------------------------
 # Replaces OUT with the model's text so the stdout contract is unchanged, exposes
@@ -470,7 +525,7 @@ if [ "$JSON_MODE" -eq 1 ] && [[ "$OUT" = *[!$' \t\n\r']* ]]; then
   # come out as one space-separated line, same file discipline as the error text.
   JDEN="$(mktemp "${TMPDIR:-/tmp}/agy-den.XXXXXX")"
   meta="$(AGY_JSON="$OUT" AGY_RESP_FILE="$RESP" AGY_ERR_FILE="$JERR" AGY_DEN_FILE="$JDEN" \
-        AGY_MODEL="$MODEL" AGY_TIER="$USAGE_TIER" python3 - <<'PY' 2>/dev/null || true
+        AGY_MODEL="$CURRENT_MODEL" AGY_TIER="$USAGE_TIER" AGY_FALLBACK_FROM="$([ "$ATTEMPT" -gt 1 ] && echo "$START_MODEL" || echo "")" python3 - <<'PY' 2>/dev/null || true
 import json, os, sys
 raw = os.environ.get("AGY_JSON", "")
 try:
@@ -509,6 +564,7 @@ print(json.dumps({
     "tier": os.environ.get("AGY_TIER", ""),
     "duration_seconds": top("duration_seconds"),
     "num_turns": top("num_turns"),
+    "fallback_from": os.environ.get("AGY_FALLBACK_FROM", ""),
 }))
 PY
 )"
@@ -571,6 +627,39 @@ if [ "$RC" -eq 0 ] && grep -qE 'print timeout after .*returning partial output' 
 fi
 
 if [ $RC -ne 0 ]; then
+  blob="$(cat "$ERR" 2>/dev/null)"
+  [ -n "$JSON_ERROR" ] && blob="$JSON_ERROR
+$blob"
+
+  shopt -s nocasematch
+  is_cap=0
+  case "$blob" in
+    *503*|*"no capacity"*|*unavailable*|*overloaded*)
+      case "$blob" in
+        # A bad model name and an exhausted quota are not capacity: they keep exits 14 / 10.
+        *"invalid --model"*|*"is not recognized as a known model"*|*"not a known model"*|\
+        *quota*|*"rate limit"*|*"resource exhausted"*) ;;
+        *) is_cap=1 ;;
+      esac
+      ;;
+  esac
+  shopt -u nocasematch
+
+  # A chain of one (pro, 'off', or no chain for this model) never fell back, so its 503
+  # stays the generic exit 2 below; 16 means "the whole chain was tried".
+  if [ "$is_cap" -eq 1 ] && [ "$TOTAL_ATTEMPTS" -gt 1 ]; then
+    if [ "$ATTEMPT" -lt "$TOTAL_ATTEMPTS" ]; then
+      continue # continue to next model in loop
+    fi
+    msg="no capacity on:"
+    for m in "${MODELS_TO_TRY[@]}"; do
+      msg="$msg $m,"
+    done
+    msg="${msg%,}"
+    signal CAPACITY_EXHAUSTED "$msg"
+    exit 16
+  fi
+
   echo "agy-delegate: agy exited $RC" >&2
   [ -s "$ERR" ] && cat "$ERR" >&2
   # In JSON mode agy puts the diagnostic in the envelope instead of stderr — relay it
@@ -582,9 +671,6 @@ if [ $RC -ne 0 ]; then
   # the diagnostic lives in the envelope's `error` field and stderr is typically
   # empty, so prefer that; otherwise fall back to stderr. Patterns are deliberately
   # specific to avoid false positives on incidental substrings.
-  blob="$(cat "$ERR" 2>/dev/null)"
-  [ -n "$JSON_ERROR" ] && blob="$JSON_ERROR
-$blob"
   shopt -s nocasematch
   case "$blob" in
     # FIRST, because these strings are the most specific ones here and must not be
@@ -605,7 +691,7 @@ $blob"
       # resolved — common when a tier_* / default_model remap points at a model this plan
       # doesn't expose. Surface it as its own actionable category.
       shopt -u nocasematch
-      echo "agy-delegate: model '$MODEL' is not available on this plan — run \`agy models\`, then fix --model / the tier_* / default_model option." >&2
+      echo "agy-delegate: model '$CURRENT_MODEL' is not available on this plan — run \`agy models\`, then fix --model / the tier_* / default_model option." >&2
       signal MODEL_UNAVAILABLE "model not in \`agy models\` (check --model / tier remaps)"; exit 14 ;;
   esac
   shopt -u nocasematch
@@ -631,9 +717,11 @@ if [[ "$OUT" != *[!$' \t\n\r']* ]]; then   # same glob as above, not the quadrat
       permission_denied ;;
   esac
   shopt -u nocasematch
-  echo "agy-delegate: agy returned empty output (model='$MODEL')" >&2
+  echo "agy-delegate: agy returned empty output (model='$CURRENT_MODEL')" >&2
   exit 3
 fi
+  break # success
+done
 
 # Digest-size guard: the cost saving depends on the conductor ingesting a DIGEST,
 # not a raw dump — if the reply is dump-sized, say so on stderr (advisory only;

@@ -3,6 +3,26 @@
 All notable changes to **Antigravity for Claude Code**. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are in `.claude-plugin/plugin.json`.
 
+## 0.29.0
+
+- **A 503 / no-capacity failure on the `flash` or `flash-lo` model now falls back down a
+  chain instead of failing the delegation.** agy answers `503: No capacity available for
+  gemini-3.8-flash-high` when the model is overloaded, which matched none of the
+  classifier's patterns and came back as a bare `agy exited 1` (exit 2). The wrapper now
+  retries once per model, at most 3 attempts in all, keeping the effort level and ending on
+  Pro: `Gemini 3.8 Flash (High)` -> `Gemini 3.7 Flash (High)` -> `Gemini 3.1 Pro (High)`,
+  and `Gemini 3.8 Flash (Low)` -> `Gemini 3.7 Flash (Low)` -> `Gemini 3.1 Pro (High)`. The
+  chain is picked by the starting model, so an explicit `--model "Gemini 3.8 Flash (High)"`
+  falls back too; `pro` has no chain — it is the last resort. Two new options,
+  `fallback_flash` / `fallback_flash_lo` (pipe-separated exact names, `off` disables),
+  replace the defaults. Quota / rate-limit and unknown-model errors are NOT capacity and
+  keep exits 10 / 14. Each hop prints one stderr line, `AGY_USAGE` names the model that ran
+  and gains a trailing `fallback_from` key (the starting model, empty when no hop), and
+  `AGY_SIGNAL` names the last model tried. When the whole chain answers 503 the wrapper
+  exits the new code `16` with a `CAPACITY_EXHAUSTED` signal; a chain of one (`pro`, `off`)
+  still exits `2`. Twelve checks cover both chains, `--model`, `pro`, quota, `off`, a
+  custom chain and the usage keys. Suite 345 -> 357.
+
 ## 0.28.0
 
 - **`AGY_USAGE` now names the model that ran, the tier it was picked from, and agy's own
